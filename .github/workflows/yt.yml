@@ -161,10 +161,11 @@ jobs:
                   except Exception as e:
                       print(f"⚠️ Progress webhook error: {str(e)}")
           
-          def download_video(video_url, video_id, folder, job_id, webhook_url):
+          def download_video(video_url, video_id, folder, job_id, webhook_url, download_all_subs):
               """Download video using yt-dlp and upload to R2"""
               
-              print(f"🚀 Starting download for video {video_id} in folder {folder}")
+              subs_mode = "all subtitles" if download_all_subs else "English subtitles only"
+              print(f"🚀 Starting download for video {video_id} in folder {folder} ({subs_mode})")
               
               # Send initial status webhook
               send_webhook(webhook_url, job_id, video_id, 'started')
@@ -211,6 +212,7 @@ jobs:
                                   print(f"⏱️ Duration: {duration // 60}:{duration % 60:02d}")
                               if filesize:
                                   print(f"📦 Estimated size: {filesize / (1024*1024):.1f} MB")
+                              print(f"🔤 Subtitles: {subs_mode}")
                           except json.JSONDecodeError:
                               print("ℹ️ Could not parse video info, proceeding with download...")
                       
@@ -222,15 +224,28 @@ jobs:
                           '--write-info-json',
                           '--write-description', 
                           '--write-thumbnail',
-                          '--write-subs',
-                          '--write-auto-subs',
-                          '--all-subs',
                           '--format', 'best[height<=1080]/best',
                           '--output', str(download_path / '%(id)s.%(ext)s'),
                           '--retries', '3',
                           '--ignore-errors',
                           '--newline',  # Better progress output formatting
                       ]
+                      
+                      # Configure subtitle options based on preference
+                      if download_all_subs:
+                          print("🌍 Downloading ALL available subtitles...")
+                          cmd.extend([
+                              '--write-subs',
+                              '--write-auto-subs',
+                              '--all-subs'
+                          ])
+                      else:
+                          print("🇺🇸 Downloading English subtitles only...")
+                          cmd.extend([
+                              '--write-subs',
+                              '--write-auto-subs',
+                              '--sub-langs', 'en,en-US,en-GB,en-CA,en-AU'
+                          ])
 
                       # Add cookies if available
                       if cookies_file and os.path.isfile(cookies_file):
@@ -278,12 +293,27 @@ jobs:
                       
                       print(f"✅ Downloaded {len(downloaded_files)} files:")
                       total_size = 0
+                      subtitle_count = 0
+                      
                       for file in downloaded_files:
                           size = file.stat().st_size
                           total_size += size
-                          print(f"  📄 {file.name} ({size / (1024*1024):.1f} MB)")
+                          file_type = ""
+                          
+                          if file.name.endswith(('.vtt', '.srt')):
+                              subtitle_count += 1
+                              file_type = " [SUBTITLE]"
+                          elif file.name.endswith(('.mp4', '.mkv', '.webm')):
+                              file_type = " [VIDEO]"
+                          elif file.name.endswith(('.jpg', '.png', '.webp')):
+                              file_type = " [THUMBNAIL]"
+                          elif file.name.endswith('.json'):
+                              file_type = " [METADATA]"
+                          
+                          print(f"  📄 {file.name} ({size / (1024*1024):.1f} MB){file_type}")
                       
                       print(f"📦 Total download size: {total_size / (1024*1024):.1f} MB")
+                      print(f"🔤 Subtitle files downloaded: {subtitle_count}")
                       
                       # Send upload starting webhook
                       send_webhook(webhook_url, job_id, video_id, 'uploading')
@@ -314,7 +344,9 @@ jobs:
                                   'categories': info_data.get('categories', []),
                                   'tags': info_data.get('tags', []),
                                   'total_download_size': total_size,
-                                  'file_count': len(downloaded_files)
+                                  'file_count': len(downloaded_files),
+                                  'subtitle_count': subtitle_count,
+                                  'download_all_subs': download_all_subs
                               }
                       
                       # Upload to R2
@@ -348,7 +380,8 @@ jobs:
                                               'folder': str(folder),
                                               'job-id': job_id,
                                               'upload-date': datetime.now().isoformat(),
-                                              'original-filename': file_path.name
+                                              'original-filename': file_path.name,
+                                              'download-all-subs': str(download_all_subs).lower()
                                           }
                                       }
                                   )
@@ -361,6 +394,10 @@ jobs:
                               raise
                       
                       print(f"🎉 Successfully uploaded all {uploaded_count} files for video {video_id}")
+                      if subtitle_count > 0:
+                          subs_summary = f"all subtitles ({subtitle_count} files)" if download_all_subs else f"English subtitles ({subtitle_count} files)"
+                          print(f"🔤 Subtitle summary: {subs_summary}")
+                      
                       return metadata
                       
                   except subprocess.TimeoutExpired:
@@ -409,19 +446,21 @@ jobs:
               video_id = os.environ.get('VIDEO_ID')
               video_url = os.environ.get('VIDEO_URL')
               folder = int(os.environ.get('FOLDER', '0'))
+              download_all_subs = os.environ.get('DOWNLOAD_ALL_SUBS', 'false').lower() == 'true'
               webhook_url = os.environ.get('WEBHOOK_URL')
               
               if not all([job_id, video_id, video_url, webhook_url]):
                   print("❌ Missing required environment variables")
                   sys.exit(1)
               
-              print(f"🎬 Processing job {job_id} for video {video_id} in folder {folder}")
+              subs_mode = "with all subtitles" if download_all_subs else "with English subtitles only"
+              print(f"🎬 Processing job {job_id} for video {video_id} in folder {folder} ({subs_mode})")
               print(f"🔗 Video URL: {video_url}")
               print(f"📡 Webhook URL: {webhook_url[:50]}...")
               
               try:
                   # Download and process video
-                  metadata = download_video(video_url, video_id, folder, job_id, webhook_url)
+                  metadata = download_video(video_url, video_id, folder, job_id, webhook_url, download_all_subs)
                   
                   # Send success webhook
                   send_webhook(webhook_url, job_id, video_id, 'completed', metadata)
@@ -449,6 +488,7 @@ jobs:
           echo "video_id=${{ github.event.client_payload.video_id }}" >> $GITHUB_OUTPUT
           echo "video_url=${{ github.event.client_payload.video_url }}" >> $GITHUB_OUTPUT
           echo "folder=${{ github.event.client_payload.folder }}" >> $GITHUB_OUTPUT
+          echo "download_all_subs=${{ github.event.client_payload.download_all_subs }}" >> $GITHUB_OUTPUT
           echo "webhook_url=${{ github.event.client_payload.webhook_url }}" >> $GITHUB_OUTPUT
 
       - name: Validate inputs
@@ -476,6 +516,7 @@ jobs:
           VIDEO_ID: ${{ steps.event.outputs.video_id }}
           VIDEO_URL: ${{ steps.event.outputs.video_url }}
           FOLDER: ${{ steps.event.outputs.folder }}
+          DOWNLOAD_ALL_SUBS: ${{ steps.event.outputs.download_all_subs }}
           WEBHOOK_URL: ${{ steps.event.outputs.webhook_url }}
         run: |
           echo "🚀 Starting video processing..."
@@ -483,6 +524,7 @@ jobs:
           echo "🎥 Video ID: $VIDEO_ID" 
           echo "🔗 Video URL: $VIDEO_URL"
           echo "📁 Folder: $FOLDER"
+          echo "🔤 Download all subtitles: $DOWNLOAD_ALL_SUBS"
           
           # Run the download script
           python download_video.py
@@ -523,3 +565,4 @@ jobs:
           echo "📋 Job ID: ${{ steps.event.outputs.job_id }}"
           echo "🎥 Video ID: ${{ steps.event.outputs.video_id }}"
           echo "📁 Folder: ${{ steps.event.outputs.folder }}"
+          echo "🔤 Download all subtitles: ${{ steps.event.outputs.download_all_subs }}"
