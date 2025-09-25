@@ -39,10 +39,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install yt-dlp boto3 requests
 
-      - name: Decode cookies.txt from secret (optional)
-        if: env.YT_COOKIES_B64
+      - name: Decode cookies.txt from secret (required)
         run: |
+          set -euo pipefail
+          if [ -z "${{ secrets.YT_COOKIES_B64 }}" ]; then
+            echo "Error: YT_COOKIES_B64 secret is required but not set."
+            exit 1
+          fi
           echo "${{ secrets.YT_COOKIES_B64 }}" | base64 -d > /tmp/cookies.txt
+          if [ ! -s /tmp/cookies.txt ]; then
+            echo "Error: Decoded /tmp/cookies.txt is empty or invalid."
+            exit 1
+          fi
           chmod 600 /tmp/cookies.txt
           echo "COOKIES_FILE=/tmp/cookies.txt" >> $GITHUB_ENV
 
