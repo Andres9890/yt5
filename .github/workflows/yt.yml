@@ -1,0 +1,337 @@
+name: YouTube Archive Download
+on:
+  repository_dispatch:
+    types: [download-video]
+
+env:
+  R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+  R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+  R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+  R2_BUCKET: ${{ secrets.R2_BUCKET }}
+  WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+
+jobs:
+  download-video:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Cache yt-dlp and dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cache/pip
+            /opt/hostedrunner/.local/lib/python*/site-packages
+          key: ${{ runner.os }}-ytdlp-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-ytdlp-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install yt-dlp boto3 requests
+
+      - name: Create download script
+        run: |
+          cat << 'EOF' > download_video.py
+          #!/usr/bin/env python3
+          import os
+          import sys
+          import json
+          import subprocess
+          import requests
+          import boto3
+          from pathlib import Path
+          import tempfile
+          import shutil
+          from datetime import datetime
+          
+          def download_video(video_url, video_id, folder, job_id):
+              """Download video using yt-dlp and upload to R2"""
+              
+              print(f"Starting download for video {video_id} in folder {folder}")
+              
+              # Create temporary directory
+              with tempfile.TemporaryDirectory() as temp_dir:
+                  download_path = Path(temp_dir) / "downloads"
+                  download_path.mkdir(exist_ok=True)
+                  
+                  # yt-dlp options - download everything
+                  ydl_opts = {
+                      'outtmpl': str(download_path / '%(id)s.%(ext)s'),
+                      'writeinfojson': True,
+                      'writedescription': True,
+                      'writethumbnail': True,
+                      'writesubtitles': True,
+                      'writeautomaticsub': True,
+                      'allsubtitles': True,
+                      'format': 'best[height<=1080]/best',  # Limit to 1080p max to save space
+                      'ignoreerrors': True,
+                      'no_warnings': False,
+                      'extract_flat': False,
+                      'retries': 3,
+                  }
+                  
+                  try:
+                      # Build yt-dlp command
+                      cmd = [
+                          'yt-dlp',
+                          '--write-info-json',
+                          '--write-description',
+                          '--write-thumbnail',
+                          '--write-subs',
+                          '--write-auto-subs',
+                          '--all-subs',
+                          '--format', 'best[height<=1080]/best',
+                          '--output', str(download_path / '%(id)s.%(ext)s'),
+                          '--retries', '3',
+                          '--ignore-errors',
+                          video_url
+                      ]
+                      
+                      print(f"Running command: {' '.join(cmd)}")
+                      
+                      # Run yt-dlp
+                      result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)  # 30 min timeout
+                      
+                      if result.returncode != 0:
+                          print(f"yt-dlp stderr: {result.stderr}")
+                          raise Exception(f"yt-dlp failed with return code {result.returncode}: {result.stderr}")
+                      
+                      print(f"yt-dlp stdout: {result.stdout}")
+                      
+                      # Find downloaded files
+                      downloaded_files = list(download_path.glob('*'))
+                      if not downloaded_files:
+                          raise Exception("No files were downloaded")
+                      
+                      print(f"Downloaded {len(downloaded_files)} files:")
+                      for file in downloaded_files:
+                          print(f"  - {file.name} ({file.stat().st_size} bytes)")
+                      
+                      # Extract metadata from info.json if available
+                      info_file = download_path / f"{video_id}.info.json"
+                      metadata = {}
+                      
+                      if info_file.exists():
+                          with open(info_file, 'r', encoding='utf-8') as f:
+                              info_data = json.load(f)
+                              metadata = {
+                                  'title': info_data.get('title', ''),
+                                  'description': info_data.get('description', ''),
+                                  'uploader': info_data.get('uploader', ''),
+                                  'upload_date': info_data.get('upload_date', ''),
+                                  'duration': info_data.get('duration', 0),
+                                  'view_count': info_data.get('view_count', 0),
+                                  'like_count': info_data.get('like_count', 0),
+                                  'thumbnail': info_data.get('thumbnail', ''),
+                                  'webpage_url': info_data.get('webpage_url', ''),
+                                  'extractor': info_data.get('extractor', ''),
+                                  'format_id': info_data.get('format_id', ''),
+                                  'width': info_data.get('width', 0),
+                                  'height': info_data.get('height', 0),
+                                  'fps': info_data.get('fps', 0),
+                                  'filesize': info_data.get('filesize', 0),
+                                  'categories': info_data.get('categories', []),
+                                  'tags': info_data.get('tags', []),
+                              }
+                      
+                      # Upload to R2
+                      s3_client = boto3.client(
+                          's3',
+                          endpoint_url=os.environ['R2_ENDPOINT'],
+                          aws_access_key_id=os.environ['R2_ACCESS_KEY_ID'],
+                          aws_secret_access_key=os.environ['R2_SECRET_ACCESS_KEY']
+                      )
+                      
+                      print("Uploading files to R2...")
+                      
+                      for file_path in downloaded_files:
+                          # Create R2 key with folder structure: folder/video_id/filename
+                          r2_key = f"{folder}/{video_id}/{file_path.name}"
+                          
+                          try:
+                              with open(file_path, 'rb') as f:
+                                  s3_client.upload_fileobj(
+                                      f,
+                                      os.environ['R2_BUCKET'],
+                                      r2_key,
+                                      ExtraArgs={
+                                          'Metadata': {
+                                              'video-id': video_id,
+                                              'folder': str(folder),
+                                              'job-id': job_id,
+                                              'upload-date': datetime.now().isoformat(),
+                                              'original-filename': file_path.name
+                                          }
+                                      }
+                                  )
+                              print(f"Uploaded: {r2_key}")
+                          except Exception as e:
+                              print(f"Failed to upload {file_path.name}: {str(e)}")
+                              raise
+                      
+                      print(f"Successfully uploaded all files for video {video_id}")
+                      return metadata
+                      
+                  except subprocess.TimeoutExpired:
+                      raise Exception("Download timeout - video took too long to process")
+                  except Exception as e:
+                      print(f"Download error: {str(e)}")
+                      raise
+          
+          def send_webhook(webhook_url, job_id, video_id, status, metadata=None, error=None):
+              """Send completion webhook to Cloudflare Worker"""
+              try:
+                  payload = {
+                      'jobId': job_id,
+                      'videoId': video_id,
+                      'status': status
+                  }
+                  
+                  if metadata:
+                      payload['metadata'] = metadata
+                  
+                  if error:
+                      payload['error'] = str(error)
+                  
+                  response = requests.post(
+                      webhook_url,
+                      json=payload,
+                      timeout=30,
+                      headers={'Content-Type': 'application/json'}
+                  )
+                  
+                  if response.status_code == 200:
+                      print(f"Webhook sent successfully for job {job_id}")
+                  else:
+                      print(f"Webhook failed: {response.status_code} - {response.text}")
+                      
+              except Exception as e:
+                  print(f"Failed to send webhook: {str(e)}")
+          
+          def main():
+              # Get parameters from GitHub event
+              job_id = os.environ.get('JOB_ID')
+              video_id = os.environ.get('VIDEO_ID')
+              video_url = os.environ.get('VIDEO_URL')
+              folder = int(os.environ.get('FOLDER', '0'))
+              webhook_url = os.environ.get('WEBHOOK_URL')
+              
+              if not all([job_id, video_id, video_url, webhook_url]):
+                  print("Missing required environment variables")
+                  sys.exit(1)
+              
+              print(f"Processing job {job_id} for video {video_id} in folder {folder}")
+              print(f"Video URL: {video_url}")
+              
+              try:
+                  # Download and process video
+                  metadata = download_video(video_url, video_id, folder, job_id)
+                  
+                  # Send success webhook
+                  send_webhook(webhook_url, job_id, video_id, 'completed', metadata)
+                  
+                  print(f"Job {job_id} completed successfully")
+                  
+              except Exception as e:
+                  print(f"Job {job_id} failed: {str(e)}")
+                  
+                  # Send failure webhook
+                  send_webhook(webhook_url, job_id, video_id, 'failed', error=str(e))
+                  
+                  sys.exit(1)
+          
+          if __name__ == "__main__":
+              main()
+          EOF
+          
+          chmod +x download_video.py
+
+      - name: Extract event data
+        id: event
+        run: |
+          echo "job_id=${{ github.event.client_payload.job_id }}" >> $GITHUB_OUTPUT
+          echo "video_id=${{ github.event.client_payload.video_id }}" >> $GITHUB_OUTPUT
+          echo "video_url=${{ github.event.client_payload.video_url }}" >> $GITHUB_OUTPUT
+          echo "folder=${{ github.event.client_payload.folder }}" >> $GITHUB_OUTPUT
+          echo "webhook_url=${{ github.event.client_payload.webhook_url }}" >> $GITHUB_OUTPUT
+
+      - name: Validate inputs
+        run: |
+          if [ -z "${{ steps.event.outputs.job_id }}" ]; then
+            echo "Error: job_id is required"
+            exit 1
+          fi
+          if [ -z "${{ steps.event.outputs.video_id }}" ]; then
+            echo "Error: video_id is required"
+            exit 1
+          fi
+          if [ -z "${{ steps.event.outputs.video_url }}" ]; then
+            echo "Error: video_url is required"
+            exit 1
+          fi
+          if [ -z "${{ steps.event.outputs.webhook_url }}" ]; then
+            echo "Error: webhook_url is required"
+            exit 1
+          fi
+
+      - name: Download and process video
+        env:
+          JOB_ID: ${{ steps.event.outputs.job_id }}
+          VIDEO_ID: ${{ steps.event.outputs.video_id }}
+          VIDEO_URL: ${{ steps.event.outputs.video_url }}
+          FOLDER: ${{ steps.event.outputs.folder }}
+          WEBHOOK_URL: ${{ steps.event.outputs.webhook_url }}
+        run: |
+          echo "Starting video processing..."
+          echo "Job ID: $JOB_ID"
+          echo "Video ID: $VIDEO_ID" 
+          echo "Video URL: $VIDEO_URL"
+          echo "Folder: $FOLDER"
+          
+          # Run the download script
+          python download_video.py
+
+      - name: Cleanup on failure
+        if: failure()
+        env:
+          JOB_ID: ${{ steps.event.outputs.job_id }}
+          VIDEO_ID: ${{ steps.event.outputs.video_id }}
+          WEBHOOK_URL: ${{ steps.event.outputs.webhook_url }}
+        run: |
+          # Send failure notification if not already sent
+          python -c "
+          import requests
+          import os
+          try:
+              requests.post(
+                  os.environ['WEBHOOK_URL'],
+                  json={
+                      'jobId': os.environ['JOB_ID'],
+                      'videoId': os.environ['VIDEO_ID'],
+                      'status': 'failed',
+                      'error': 'Workflow failed during execution'
+                  },
+                  timeout=10
+              )
+              print('Failure webhook sent')
+          except Exception as e:
+              print(f'Failed to send failure webhook: {e}')
+          "
+
+      - name: Log completion
+        if: success()
+        run: |
+          echo "Video processing completed successfully"
+          echo "Job ID: ${{ steps.event.outputs.job_id }}"
+          echo "Video ID: ${{ steps.event.outputs.video_id }}"
+          echo "Folder: ${{ steps.event.outputs.folder }}"
