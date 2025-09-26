@@ -161,11 +161,14 @@ jobs:
                   except Exception as e:
                       print(f"⚠️ Progress webhook error: {str(e)}")
           
-          def download_video(video_url, video_id, folder, job_id, webhook_url, download_all_subs):
+          def download_video(video_url, video_id, folder, job_id, webhook_url, download_all_subs, download_all_resolutions):
               """Download video using yt-dlp and upload to R2"""
               
               subs_mode = "all subtitles" if download_all_subs else "English subtitles only"
-              print(f"🚀 Starting download for video {video_id} in folder {folder} ({subs_mode})")
+              res_mode = "highest quality available" if download_all_resolutions else "up to 1080p"
+              print(f"🚀 Starting download for video {video_id} in folder {folder}")
+              print(f"🔤 Subtitles: {subs_mode}")
+              print(f"🎬 Quality: {res_mode}")
               
               # Send initial status webhook
               send_webhook(webhook_url, job_id, video_id, 'started')
@@ -205,14 +208,19 @@ jobs:
                               duration = video_info.get('duration', 0)
                               uploader = video_info.get('uploader', 'Unknown')
                               filesize = video_info.get('filesize_approx') or video_info.get('filesize', 0)
+                              width = video_info.get('width', 0)
+                              height = video_info.get('height', 0)
                               
                               print(f"📺 Video: {title}")
                               print(f"👤 Uploader: {uploader}")
                               if duration:
                                   print(f"⏱️ Duration: {duration // 60}:{duration % 60:02d}")
+                              if width and height:
+                                  print(f"📐 Resolution: {width}x{height}")
                               if filesize:
                                   print(f"📦 Estimated size: {filesize / (1024*1024):.1f} MB")
                               print(f"🔤 Subtitles: {subs_mode}")
+                              print(f"🎬 Quality: {res_mode}")
                           except json.JSONDecodeError:
                               print("ℹ️ Could not parse video info, proceeding with download...")
                       
@@ -224,12 +232,19 @@ jobs:
                           '--write-info-json',
                           '--write-description', 
                           '--write-thumbnail',
-                          '--format', 'best[height<=1080]/best',
                           '--output', str(download_path / '%(id)s.%(ext)s'),
                           '--retries', '3',
                           '--ignore-errors',
                           '--newline',  # Better progress output formatting
                       ]
+                      
+                      # Configure format/quality options based on preference
+                      if download_all_resolutions:
+                          print("🎬 Downloading highest quality available (no resolution limit)...")
+                          cmd.extend(['--format', 'best'])
+                      else:
+                          print("🎬 Downloading best quality up to 1080p...")
+                          cmd.extend(['--format', 'best[height<=1080]/best'])
                       
                       # Configure subtitle options based on preference
                       if download_all_subs:
@@ -294,6 +309,7 @@ jobs:
                       print(f"✅ Downloaded {len(downloaded_files)} files:")
                       total_size = 0
                       subtitle_count = 0
+                      video_file_size = 0
                       
                       for file in downloaded_files:
                           size = file.stat().st_size
@@ -305,6 +321,7 @@ jobs:
                               file_type = " [SUBTITLE]"
                           elif file.name.endswith(('.mp4', '.mkv', '.webm')):
                               file_type = " [VIDEO]"
+                              video_file_size = size
                           elif file.name.endswith(('.jpg', '.png', '.webp')):
                               file_type = " [THUMBNAIL]"
                           elif file.name.endswith('.json'):
@@ -313,6 +330,8 @@ jobs:
                           print(f"  📄 {file.name} ({size / (1024*1024):.1f} MB){file_type}")
                       
                       print(f"📦 Total download size: {total_size / (1024*1024):.1f} MB")
+                      if video_file_size > 0:
+                          print(f"🎬 Main video file size: {video_file_size / (1024*1024):.1f} MB")
                       print(f"🔤 Subtitle files downloaded: {subtitle_count}")
                       
                       # Send upload starting webhook
@@ -346,7 +365,8 @@ jobs:
                                   'total_download_size': total_size,
                                   'file_count': len(downloaded_files),
                                   'subtitle_count': subtitle_count,
-                                  'download_all_subs': download_all_subs
+                                  'download_all_subs': download_all_subs,
+                                  'download_all_resolutions': download_all_resolutions
                               }
                       
                       # Upload to R2
@@ -381,7 +401,8 @@ jobs:
                                               'job-id': job_id,
                                               'upload-date': datetime.now().isoformat(),
                                               'original-filename': file_path.name,
-                                              'download-all-subs': str(download_all_subs).lower()
+                                              'download-all-subs': str(download_all_subs).lower(),
+                                              'download-all-resolutions': str(download_all_resolutions).lower()
                                           }
                                       }
                                   )
@@ -397,6 +418,9 @@ jobs:
                       if subtitle_count > 0:
                           subs_summary = f"all subtitles ({subtitle_count} files)" if download_all_subs else f"English subtitles ({subtitle_count} files)"
                           print(f"🔤 Subtitle summary: {subs_summary}")
+                      
+                      res_summary = "highest quality available" if download_all_resolutions else "up to 1080p quality"
+                      print(f"🎬 Quality summary: {res_summary}")
                       
                       return metadata
                       
@@ -447,6 +471,7 @@ jobs:
               video_url = os.environ.get('VIDEO_URL')
               folder = int(os.environ.get('FOLDER', '0'))
               download_all_subs = os.environ.get('DOWNLOAD_ALL_SUBS', 'false').lower() == 'true'
+              download_all_resolutions = os.environ.get('DOWNLOAD_ALL_RESOLUTIONS', 'false').lower() == 'true'
               webhook_url = os.environ.get('WEBHOOK_URL')
               
               if not all([job_id, video_id, video_url, webhook_url]):
@@ -454,13 +479,16 @@ jobs:
                   sys.exit(1)
               
               subs_mode = "with all subtitles" if download_all_subs else "with English subtitles only"
-              print(f"🎬 Processing job {job_id} for video {video_id} in folder {folder} ({subs_mode})")
+              res_mode = "with highest quality" if download_all_resolutions else "with quality up to 1080p"
+              print(f"🎬 Processing job {job_id} for video {video_id} in folder {folder}")
               print(f"🔗 Video URL: {video_url}")
+              print(f"🔤 Subtitle mode: {subs_mode}")
+              print(f"🎬 Resolution mode: {res_mode}")
               print(f"📡 Webhook URL: {webhook_url[:50]}...")
               
               try:
                   # Download and process video
-                  metadata = download_video(video_url, video_id, folder, job_id, webhook_url, download_all_subs)
+                  metadata = download_video(video_url, video_id, folder, job_id, webhook_url, download_all_subs, download_all_resolutions)
                   
                   # Send success webhook
                   send_webhook(webhook_url, job_id, video_id, 'completed', metadata)
@@ -489,6 +517,7 @@ jobs:
           echo "video_url=${{ github.event.client_payload.video_url }}" >> $GITHUB_OUTPUT
           echo "folder=${{ github.event.client_payload.folder }}" >> $GITHUB_OUTPUT
           echo "download_all_subs=${{ github.event.client_payload.download_all_subs }}" >> $GITHUB_OUTPUT
+          echo "download_all_resolutions=${{ github.event.client_payload.download_all_resolutions }}" >> $GITHUB_OUTPUT
           echo "webhook_url=${{ github.event.client_payload.webhook_url }}" >> $GITHUB_OUTPUT
 
       - name: Validate inputs
@@ -517,6 +546,7 @@ jobs:
           VIDEO_URL: ${{ steps.event.outputs.video_url }}
           FOLDER: ${{ steps.event.outputs.folder }}
           DOWNLOAD_ALL_SUBS: ${{ steps.event.outputs.download_all_subs }}
+          DOWNLOAD_ALL_RESOLUTIONS: ${{ steps.event.outputs.download_all_resolutions }}
           WEBHOOK_URL: ${{ steps.event.outputs.webhook_url }}
         run: |
           echo "🚀 Starting video processing..."
@@ -525,6 +555,7 @@ jobs:
           echo "🔗 Video URL: $VIDEO_URL"
           echo "📁 Folder: $FOLDER"
           echo "🔤 Download all subtitles: $DOWNLOAD_ALL_SUBS"
+          echo "🎬 Download all resolutions: $DOWNLOAD_ALL_RESOLUTIONS"
           
           # Run the download script
           python download_video.py
@@ -566,3 +597,4 @@ jobs:
           echo "🎥 Video ID: ${{ steps.event.outputs.video_id }}"
           echo "📁 Folder: ${{ steps.event.outputs.folder }}"
           echo "🔤 Download all subtitles: ${{ steps.event.outputs.download_all_subs }}"
+          echo "🎬 Download all resolutions: ${{ steps.event.outputs.download_all_resolutions }}"
